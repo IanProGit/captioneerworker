@@ -5,44 +5,70 @@ from supabase import create_client
 
 app = Flask(__name__)
 
+# Read Supabase secrets from env
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-OUTPUTS_BUCKET = os.environ.get("SUPABASE_OUTPUTS_BUCKET","outputs")
+OUTPUTS_BUCKET = os.environ.get("SUPABASE_OUTPUTS_BUCKET", "outputs")
+
 supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 @app.get("/health")
-def health(): return jsonify(ok=True), 200
+def health():
+    return jsonify(ok=True), 200
 
 @app.get("/")
-def index(): return "Captioneer worker is up", 200
+def index():
+    return "Captioneer worker is up", 200
 
 @app.post("/enqueue")
 def enqueue():
-    if request.headers.get("Authorization","") != f"Bearer {os.environ.get('WORKER_TOKEN')}":
+    # Check token
+    if request.headers.get("Authorization", "") != f"Bearer {os.environ.get('WORKER_TOKEN')}":
         return jsonify(error="unauthorized"), 401
+
     data = request.get_json(silent=True) or {}
     job_id = data.get("job_id")
-    if not job_id: return jsonify(error="missing job_id"), 400
+    if not job_id:
+        return jsonify(error="missing job_id"), 400
 
-    supa.table("transcription_jobs").update({
-        "status":"processing",
-        "claimed_by":"captioneerworker",
-        "claimed_at": datetime.utcnow().isoformat()+"Z"
-    }).eq("id", job_id).execute()
+    print("===> Worker received job_id:", job_id)
 
-    row = supa.table("transcription_jobs").select("user_id").eq("id", job_id).single().execute().data
-    user_id = row["user_id"] if row else "unknown"
+    # 1) Update to processing
+    try:
+        res1 = supa.table("transcription_jobs").update({
+            "status": "processing",
+            "claimed_by": "captioneerworker",
+            "claimed_at": datetime.utcnow().isoformat() + "Z"
+        }).eq("id", job_id).execute()
+        print("Update to processing result:", res1)
+    except Exception as e:
+        print("Error updating to processing:", e)
 
+    # 2) Create stub VTT file
     vtt = "WEBVTT\n\n00:00.000 --> 00:01.500\n[auto-caption stub]\n"
-    key = f"{user_id}/{job_id}.vtt"
-    supa.storage.from_(OUTPUTS_BUCKET).upload(key, vtt.encode("utf-8"), {"content-type":"text/vtt","upsert":"true"})
-    signed = supa.storage.from_(OUTPUTS_BUCKET).create_signed_url(key, 7*24*3600)
-    vtt_url = signed.get("signedURL") if isinstance(signed, dict) else signed.signed_url
+    key = f"{job_id}.vtt"
+    vtt_url = None
+    try:
+        supa.storage.from_(OUTPUTS_BUCKET).upload(
+            key,
+            vtt.encode("utf-8"),
+            {"content-type": "text/vtt", "upsert": "true"}
+        )
+        signed = supa.storage.from_(OUTPUTS_BUCKET).create_signed_url(key, 7*24*3600)
+        vtt_url = signed.get("signedURL") if isinstance(signed, dict) else signed.signed_url
+        print("Stub VTT uploaded, signed URL:", vtt_url)
+    except Exception as e:
+        print("Error writing VTT:", e)
 
-    supa.table("transcription_jobs").update({
-        "status":"done",
-        "outputs": json.dumps({"vtt": vtt_url})
-    }).eq("id", job_id).execute()
+    # 3) Update to done
+    try:
+        res2 = supa.table("transcription_jobs").update({
+            "status": "completed",
+            "outputs": json.dumps({"vtt": vtt_url}) if vtt_url else "{}"
+        }).eq("id", job_id).execute()
+        print("Update to done result:", res2)
+    except Exception as e:
+        print("Error updating to done:", e)
 
     return jsonify(accepted=True, id=job_id), 202
 
