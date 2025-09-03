@@ -1,11 +1,11 @@
-.venv/
+.git/
+.gitignore
 __pycache__/
 *.pyc
+.venv/
 .DS_Store
 .vscode/
 .idea/
-.git/
-.gitignore
 *.log
 build/
 dist/

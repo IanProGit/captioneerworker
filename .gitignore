@@ -1,1 +1,11 @@
-(paste the above block)
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.vscode/
+.idea/
+*.log
+build/
+dist/
+*.egg-info/
+.eggs/
