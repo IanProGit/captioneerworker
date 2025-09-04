@@ -92,3 +92,11 @@ def enqueue():
         print("WORKER_ERROR:", e)
         return jsonify(error=str(e), detail=repr(e)), 500
 # redeploy test Thu  4 Sep 2025 11:44:28 CEST
+
+@app.errorhandler(Exception)
+def _json_error(e):
+    import traceback
+    return jsonify(
+        error=str(e),
+        detail=traceback.format_exc()
+    ), 500
