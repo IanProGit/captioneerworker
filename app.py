@@ -91,3 +91,4 @@ def enqueue():
         supa.table("transcription_jobs").update({"status":"failed","error":str(e)}).eq("id", job_id).execute()
         print("WORKER_ERROR:", e)
         return jsonify(error=str(e)), 500
+# redeploy test Thu  4 Sep 2025 11:44:28 CEST
