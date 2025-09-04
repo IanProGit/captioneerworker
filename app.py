@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request
-import os, json
+import os, json, tempfile, subprocess, requests
 from datetime import datetime
 from supabase import create_client
 
@@ -8,64 +8,71 @@ app = Flask(__name__)
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 OUTPUTS_BUCKET = os.environ.get("SUPABASE_OUTPUTS_BUCKET","outputs")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN","")
+VIDEOS_BUCKET  = os.environ.get("SUPABASE_VIDEOS_BUCKET","videos")
+WORKER_TOKEN   = os.environ.get("WORKER_TOKEN","")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY","")
 
 supa = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-@app.get("/health")
-def health(): return jsonify(ok=True), 200
-
-@app.get("/")
-def index(): return "Captioneer worker is up", 200
 
 @app.post("/enqueue")
 def enqueue():
     if request.headers.get("Authorization","") != f"Bearer {WORKER_TOKEN}":
-        print("AUTH FAIL")
         return jsonify(error="unauthorized"), 401
+    job_id = (request.get_json(silent=True) or {}).get("job_id")
+    if not job_id: return jsonify(error="missing job_id"), 400
 
-    data = request.get_json(silent=True) or {}
-    job_id = data.get("job_id")
-    if not job_id:
-        print("NO JOB_ID")
-        return jsonify(error="missing job_id"), 400
+    # mark processing
+    supa.table("transcription_jobs").update({
+        "status":"processing","claimed_by":"captioneerworker",
+        "claimed_at": datetime.utcnow().isoformat()+"Z"
+    }).eq("id", job_id).execute()
 
-    print("JOB:", job_id)
+    # fetch job row (need user_id + input_video_path)
+    row = supa.table("transcription_jobs").select("user_id,input_video_path").eq("id", job_id).single().execute().data
+    if not row or not row.get("input_video_path"):
+        supa.table("transcription_jobs").update({"status":"failed","error":"missing input_video_path"}).eq("id", job_id).execute()
+        return jsonify(error="missing input_video_path"), 400
 
-    try:
-        r1 = supa.table("transcription_jobs").update({
-            "status":"processing",
-            "claimed_by":"captioneerworker",
-            "claimed_at": datetime.utcnow().isoformat()+"Z"
-        }).eq("id", job_id).execute()
-        print("UPDATE->processing:", r1)
-    except Exception as e:
-        print("ERR processing:", e)
-
-    vtt = "WEBVTT\n\n00:00.000 --> 00:01.500\n[auto-caption stub]\n"
-    key = f"{job_id}.vtt"
-    vtt_url = None
-    try:
-        supa.storage.from_(OUTPUTS_BUCKET).upload(
-            key, vtt.encode("utf-8"),
-            {"content-type":"text/vtt","upsert":"true"}
-        )
-        s = supa.storage.from_(OUTPUTS_BUCKET).create_signed_url(key, 7*24*3600)
-        vtt_url = s.get("signedURL") if isinstance(s, dict) else getattr(s, "signed_url", None)
-        print("VTT URL:", vtt_url)
-    except Exception as e:
-        print("ERR VTT:", e)
+    user_id = row["user_id"]
+    key     = row["input_video_path"]                     # e.g. "{uid}/lessons/.../core.mp4"
+    # signed download URL for the video
+    s = supa.storage.from_(VIDEOS_BUCKET).create_signed_url(key, 3600)
+    url = s.get("signedURL") if isinstance(s, dict) else getattr(s, "signed_url", None)
+    if not url:
+        supa.table("transcription_jobs").update({"status":"failed","error":"signed url failed"}).eq("id", job_id).execute()
+        return jsonify(error="signed url failed"), 500
 
     try:
-        r2 = supa.table("transcription_jobs").update({
-            "status":"completed",
-            "outputs": json.dumps({"vtt": vtt_url}) if vtt_url else "{}"
-        }).eq("id", job_id).execute()
-        print("UPDATE->completed:", r2)
+        with tempfile.TemporaryDirectory() as td:
+            mp4 = os.path.join(td,"in.mp4")
+            wav = os.path.join(td,"in.wav")
+
+            # download video
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            open(mp4,"wb").write(r.content)
+
+            # extract mono 16k WAV
+            subprocess.check_call(["ffmpeg","-y","-i",mp4,"-vn","-ac","1","-ar","16000",wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # call OpenAI Whisper -> VTT
+            files = {"file": open(wav,"rb")}
+            data  = {"model":"whisper-1","response_format":"vtt"}
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            tr = requests.post("https://api.openai.com/v1/audio/transcriptions", files=files, data=data, headers=headers, timeout=600)
+            tr.raise_for_status()
+            vtt_bytes = tr.content
+
+        # upload VTT
+        out_key = f"{user_id}/{job_id}.vtt"
+        supa.storage.from_(OUTPUTS_BUCKET).upload(out_key, vtt_bytes, {"content-type":"text/vtt","upsert":"true"})
+        signed = supa.storage.from_(OUTPUTS_BUCKET).create_signed_url(out_key, 7*24*3600)
+        vtt_url = signed.get("signedURL") if isinstance(signed, dict) else getattr(signed, "signed_url", None)
+
+        # mark completed
+        supa.table("transcription_jobs").update({"status":"completed","outputs": json.dumps({"vtt": vtt_url})}).eq("id", job_id).execute()
+        return jsonify(accepted=True, id=job_id), 202
+
     except Exception as e:
-        print("ERR completed:", e)
-
-    return jsonify(accepted=True, id=job_id), 202
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")))
+        supa.table("transcription_jobs").update({"status":"failed","error":str(e)}).eq("id", job_id).execute()
+        return jsonify(error=str(e)), 500
