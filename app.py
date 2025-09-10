@@ -1,60 +1,142 @@
-# app.py
-# Caption worker — accepts {job_id, signed_url, bytes, content_type, lesson_id},
-# early-ACKs, pulls video via signed URL, transcribes with Whisper, stores VTT in Supabase.
-# Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY, WORKER_TOKEN
-# Optional Env: SUPABASE_OUTPUTS_BUCKET=outputs, CONNECT_TIMEOUT_MS=30000, TOTAL_TIMEOUT_MS=900000, RETRY_COUNT=3, RETRY_BASE_MS=500
+#!/usr/bin/env python3
+"""
+app.py
+Caption worker — Early ACKs, pulls media via signed URL, extracts audio (optional),
+transcribes with Whisper, stores VTT in Supabase, and writes outputs/metrics.
 
-import os, re, time, tempfile, threading, uuid, requests
+Required env:
+  SUPABASE_URL
+  SUPABASE_SERVICE_ROLE_KEY
+  OPENAI_API_KEY
+  WORKER_TOKEN
+
+Optional env:
+  SUPABASE_OUTPUTS_BUCKET=outputs
+  CONNECT_TIMEOUT_MS=30000
+  TOTAL_TIMEOUT_MS=900000
+  RETRY_COUNT=3
+  RETRY_BASE_MS=500
+  AUDIO_ONLY=true            # If "true", extract audio for Whisper (recommended)
+  AUDIO_BITRATE_KBPS=64      # 64 → ~0.5 MB/min at 16 kHz mono
+  PORT=10000
+  MAX_CONCURRENT_JOBS=5      # Maximum concurrent processing jobs
+
+Dependencies: pip install flask supabase requests
+Runtime: Ensure ffmpeg is installed on Render (e.g., via build.sh or Dockerfile)
+"""
+
+import os
+import re
+import sys
+import uuid
+import time
+import tempfile
+import threading
+import subprocess
+import requests
+import logging
+import atexit
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# ---------- Env ----------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
-OUTPUTS_BUCKET = os.environ.get("SUPABASE_OUTPUTS_BUCKET", "outputs")
+# ---------- Env + Constants ----------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "").strip()
+
+OUTPUTS_BUCKET = os.environ.get("SUPABASE_OUTPUTS_BUCKET", "outputs").strip()
 
 CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT_MS", "30000")) / 1000.0
-TOTAL_TIMEOUT   = int(os.environ.get("TOTAL_TIMEOUT_MS",   "900000")) / 1000.0
-RETRY_COUNT     = int(os.environ.get("RETRY_COUNT", "3"))
-RETRY_BASE_MS   = int(os.environ.get("RETRY_BASE_MS", "500"))
+TOTAL_TIMEOUT = int(os.environ.get("TOTAL_TIMEOUT_MS", "900000")) / 1000.0
+RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
+RETRY_BASE_MS = int(os.environ.get("RETRY_BASE_MS", "500"))
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
+
+AUDIO_ONLY = os.environ.get("AUDIO_ONLY", "true").lower() == "true"
+AUDIO_BITRATE_KBPS = int(os.environ.get("AUDIO_BITRATE_KBPS", "64"))
+
+# Hard fail if critical envs missing
+missing = [k for k, v in [
+    ("SUPABASE_URL", SUPABASE_URL),
+    ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY),
+    ("OPENAI_API_KEY", OPENAI_API_KEY),
+    ("WORKER_TOKEN", WORKER_TOKEN),
+] if not v]
+if missing:
+    print(f"[FATAL] Missing required env vars: {', '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+
+# Configure logging for Render
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 supa: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# single-job concurrency
-_concurrency_lock = threading.Semaphore(1)
+# Concurrency control with thread pool
+_CONCURRENCY = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
+temp_files = []  # Track temp files for cleanup
 
+# UUID validation regex
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', re.I)
+
+# One-time ffmpeg check
+def _ffmpeg_available() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except Exception:
+        return False
+FFMPEG_OK = _ffmpeg_available()
+
+# Cleanup temp files on shutdown
+def cleanup_temp_files():
+    for path in temp_files:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp file {path}: {e}")
+atexit.register(cleanup_temp_files)
 
 # ---------- Helpers ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def ok(payload: dict, code: int = 200): return jsonify(payload), code
+def ok(payload: dict, code: int = 200):
+    return jsonify(payload), code
+
 def err(msg: str, code: int = 400, detail: str | None = None):
     body = {"ok": False, "error": msg}
     if detail: body["detail"] = detail
     return jsonify(body), code
 
-def is_uuid(x: str) -> bool:
-    return bool(UUID_RE.match(str(x or "")))
+def is_uuid(s: str) -> bool:
+    return bool(UUID_RE.match(str(s or "").strip()))
 
 def backoff(attempt: int) -> float:
     return (RETRY_BASE_MS * (2 ** attempt)) / 1000.0
 
 def supa_exec(res):
-    # supabase-py may return an object with .data or a plain list
-    return getattr(res, "data", res)
+    return getattr(res, "data", []) or []
+
+def validate_status(status: str) -> bool:
+    return status in {"queued", "processing", "completed", "failed"}
 
 def update_job(job_id: str, patch: dict):
+    if not validate_status(patch.get("status", "")):
+        raise ValueError(f"Invalid status: {patch.get('status')}")
+    patch = dict(patch or {})
     patch["updated_at"] = now_iso()
     try:
         supa.table("transcription_jobs").update(patch).eq("id", job_id).execute()
+        logger.info(f"Updated job {job_id} with {patch}")
     except Exception as e:
-        app.logger.warning(f"update_job failed: {e}")
+        logger.warning(f"update_job failed for {job_id}: {e}")
+        raise
 
 def claim_job(job_id: str) -> dict | None:
     now = now_iso()
@@ -68,17 +150,17 @@ def claim_job(job_id: str) -> dict | None:
         rows = supa_exec(res)
         if rows:
             return rows[0]
-        # already claimed elsewhere?
         res2 = supa.table("transcription_jobs").select(
             "id,lesson_id,input_video_path,status,claimed_by,claimed_at"
         ).eq("id", job_id).eq("status", "processing").execute()
-        rows2 = supa_exec(res2) or []
+        rows2 = supa_exec(res2)
         return rows2[0] if rows2 else None
     except Exception as e:
-        app.logger.exception("claim_job failed")
+        logger.exception(f"claim_job failed for {job_id}")
         return None
 
-def download_signed_url(url: str, expected_bytes: int | None):
+@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
+def download_signed_url(signed_url: str, expected_bytes: int | None) -> tuple[str, int, int]:
     start = time.time()
     attempt = 0
     last_err = None
@@ -86,121 +168,167 @@ def download_signed_url(url: str, expected_bytes: int | None):
     while attempt <= RETRY_COUNT:
         try:
             with requests.get(
-                url, stream=True,
-                timeout=(CONNECT_TIMEOUT, TOTAL_TIMEOUT),
-                headers={"Range": "bytes=0-"}
+                signed_url, stream=True, timeout=(CONNECT_TIMEOUT, TOTAL_TIMEOUT),
+                verify=True, headers={"Range": "bytes=0-"}
             ) as r:
                 r.raise_for_status()
                 total = 0
                 fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+                temp_files.append(tmp_path)
                 with os.fdopen(fd, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
                             total += len(chunk)
-            if expected_bytes:
-                diff = abs(total - expected_bytes) / float(expected_bytes)
-                if diff > 0.01:
-                    raise RuntimeError(f"size mismatch: got {total}, expected {expected_bytes}")
+                if expected_bytes and abs(total - expected_bytes) / expected_bytes > 0.01:
+                    raise RuntimeError(f"Size mismatch: got {total}, expected {expected_bytes}")
             ms = int((time.time() - start) * 1000)
             return tmp_path, total, ms
-        except Exception as e:
+        except requests.RequestException as e:
             last_err = e
+            logger.warning(f"Download attempt {attempt + 1}/{RETRY_COUNT} failed: {e}")
             time.sleep(backoff(attempt))
             attempt += 1
-            continue
-    raise RuntimeError(f"signed_url_download_failed: {last_err}")
+            if tmp_path and os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except Exception: logger.warning(f"Cleanup failed for {tmp_path}")
+                temp_files.remove(tmp_path)
+                tmp_path = None
+    raise RuntimeError(f"Download failed after {RETRY_COUNT} retries: {last_err}")
 
-def whisper_to_vtt(file_path: str, content_type: str = "video/mp4"):
+@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
+def extract_audio(input_path: str, target_bitrate_kbps: int = AUDIO_BITRATE_KBPS) -> tuple[str, int, int]:
+    if not FFMPEG_OK:
+        raise RuntimeError("ffmpeg not available on worker; set AUDIO_ONLY=false")
     start = time.time()
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    temp_files.append(out_path)
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path, "-vn", "-ac", "1", "-ar", "16000",
+        "-b:a", f"{target_bitrate_kbps}k", out_path
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    size = os.path.getsize(out_path)
+    ms = int((time.time() - start) * 1000)
+    if not os.path.exists(out_path) or size == 0:
+        raise RuntimeError("Audio extraction failed or produced empty file")
+    return out_path, size, ms
+
+@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
+def whisper_to_vtt(file_path: str, mime: str, force_audio: bool) -> tuple[bytes, int]:
+    start = time.time()
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "verify": True}
+    if force_audio:
+        filename = "audio.wav"
+        content_type = "audio/wav"
+    else:
+        content_type = mime or "video/mp4"
+        ext = "mp4" if "mp4" in content_type else "wav" if "wav" in content_type else "mp3"
+        filename = f"input.{ext}"
     with open(file_path, "rb") as f:
-        files = {"file": ("video", f, content_type)}
+        files = {"file": (filename, f, content_type)}
         data = {"model": "whisper-1", "response_format": "vtt"}
         r = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
-            headers=headers, files=files, data=data, timeout=TOTAL_TIMEOUT
+            headers=headers, files=files, data=data, timeout=TOTAL_TIMEOUT, verify=True
         )
     if r.status_code // 100 != 2:
-        raise RuntimeError(f"whisper failed: {r.status_code} {r.text[:500]}")
+        raise RuntimeError(f"Whisper failed: {r.status_code} {r.text[:500]}")
     ms = int((time.time() - start) * 1000)
     return r.text.encode("utf-8"), ms
 
+@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
 def upload_vtt(job_id: str, vtt_bytes: bytes) -> str:
     key = f"{job_id}.vtt"
     up = supa.storage.from_(OUTPUTS_BUCKET).upload(key, vtt_bytes)
-    # Handle both shapes
     if hasattr(up, "error") and up.error:
-        raise RuntimeError(f"upload failed: {up.error.message}")
+        raise RuntimeError(f"Upload failed: {up.error.message}")
     signed = supa.storage.from_(OUTPUTS_BUCKET).create_signed_url(key, 7 * 24 * 3600)
-    url = None
-    if isinstance(signed, dict):
-        url = signed.get("signedURL") or signed.get("signedUrl") or signed.get("signed_url")
-    else:
-        url = getattr(signed, "signed_url", None)
+    url = signed.get("signedURL") or signed.get("signedUrl") or signed.get("signed_url") or signed.signed_url
     if not url:
-        raise RuntimeError("signed url creation failed")
+        raise RuntimeError("Signed URL creation failed")
     return url
 
 def process_job_async(job_id: str, signed_url: str, expected_bytes: int | None, content_type: str):
-    with _concurrency_lock:
-        tmp_path = None
+    with _CONCURRENCY:
+        media_path, audio_path = None, None
         try:
             update_job(job_id, {"status": "processing"})
+            logger.info(f"Processing job {job_id} started")
+            # 1) Download media
             try:
-                tmp_path, downloaded_bytes, download_ms = download_signed_url(signed_url, expected_bytes)
+                media_path, download_bytes, download_ms = download_signed_url(signed_url, expected_bytes)
             except Exception as e:
-                update_job(job_id, {"status": "failed", "error": f"download failed: {str(e)[:500]}"})
+                update_job(job_id, {"status": "failed", "error": f"Download failed: {str(e)[:500]}"})
                 return
 
+            # 2) Extract audio if enabled
+            whisper_input_path, whisper_force_audio, whisper_mime = media_path, False, content_type
+            if AUDIO_ONLY:
+                try:
+                    audio_path, audio_bytes, audio_ms = extract_audio(media_path, AUDIO_BITRATE_KBPS)
+                    whisper_input_path, whisper_force_audio, whisper_mime = audio_path, True, "audio/wav"
+                except Exception as e:
+                    update_job(job_id, {"status": "failed", "error": f"Audio extraction failed: {str(e)[:500]}"})
+                    return
+
+            # 3) Transcribe with Whisper
             try:
-                vtt_bytes, transcribe_ms = whisper_to_vtt(tmp_path, content_type)
+                vtt_bytes, transcribe_ms = whisper_to_vtt(whisper_input_path, whisper_mime, whisper_force_audio)
             except Exception as e:
-                update_job(job_id, {"status": "failed", "error": f"whisper failed: {str(e)[:500]}"})
+                update_job(job_id, {"status": "failed", "error": f"Whisper failed: {str(e)[:500]}"})
                 return
 
+            # 4) Upload VTT
             try:
                 vtt_url = upload_vtt(job_id, vtt_bytes)
             except Exception as e:
-                update_job(job_id, {"status": "failed", "error": f"upload failed: {str(e)[:500]}"})
+                update_job(job_id, {"status": "failed", "error": f"Upload failed: {str(e)[:500]}"})
                 return
 
+            # 5) Store metrics
             outputs = {
                 "vtt": vtt_url,
                 "metrics": {
-                    "download_bytes": downloaded_bytes,
+                    "download_bytes": download_bytes,
                     "download_ms": download_ms,
-                    "transcribe_ms": transcribe_ms
+                    **({"audio_bytes": audio_bytes, "audio_ms": audio_ms} if AUDIO_ONLY else {}),
+                    "transcribe_ms": transcribe_ms,
+                    "audio_only": AUDIO_ONLY
                 }
             }
             update_job(job_id, {"status": "completed", "outputs": outputs})
+            logger.info(f"Job {job_id} completed successfully")
+        except Exception as e:
+            update_job(job_id, {"status": "failed", "error": f"Unexpected error: {str(e)[:500]}"})
         finally:
-            try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+            for path in [media_path, audio_path]:
+                if path and os.path.exists(path):
+                    try: os.remove(path)
+                    except Exception: logger.warning(f"Cleanup failed for {path}")
 
 # ---------- Routes ----------
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return ok({
-        "ok": True, "service": "captioneerworker",
+        "ok": True,
+        "service": "captioneerworker",
         "env": {
             "SUPABASE_URL": bool(SUPABASE_URL),
             "SERVICE_ROLE": bool(SUPABASE_SERVICE_ROLE_KEY),
             "OPENAI_API_KEY": bool(OPENAI_API_KEY),
             "WORKER_TOKEN": bool(WORKER_TOKEN),
-            "OUTPUTS_BUCKET": OUTPUTS_BUCKET
+            "OUTPUTS_BUCKET": OUTPUTS_BUCKET,
+            "AUDIO_ONLY": AUDIO_ONLY,
+            "FFMPEG": FFMPEG_OK
         }
     })
 
-@app.post("/enqueue")
+@app.route("/enqueue", methods=["POST"])
 def enqueue():
-    if not WORKER_TOKEN:
-        return err("server_config_missing", 500)
     auth = (request.headers.get("Authorization") or "").strip()
-    if not auth.lower().startswith("bearer ") or auth.split(" ", 1)[1].strip() != WORKER_TOKEN.strip():
+    if not auth.lower().startswith("bearer ") or auth.split(" ", 1)[1].strip() != WORKER_TOKEN:
         return err("unauthorized", 401)
 
     if not request.is_json:
@@ -210,7 +338,7 @@ def enqueue():
     job_id = body.get("job_id")
     signed_url = body.get("signed_url")
     expected_bytes = body.get("bytes")
-    content_type = body.get("content_type") or "video/mp4"
+    content_type = (body.get("content_type") or "video/mp4").lower()
 
     if not job_id or not is_uuid(job_id):
         return err("bad_job_id", 400)
@@ -221,8 +349,11 @@ def enqueue():
     if not job:
         return ok({"ok": True, "claimed": False, "job_id": job_id}, 202)
 
-    # Early ACK; heavy work in background
-    t = threading.Thread(target=process_job_async, args=(job_id, signed_url, expected_bytes, content_type), daemon=True)
+    t = threading.Thread(
+        target=process_job_async,
+        args=(job_id, signed_url, expected_bytes, content_type),
+        daemon=True
+    )
     t.start()
     return ok({"ok": True, "claimed": True, "job_id": job_id}, 202)
 
