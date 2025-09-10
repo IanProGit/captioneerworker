@@ -1,4 +1,4 @@
-flask==3.0.3
-gunicorn==22.0.0
-supabase==2.10.0
-requests==2.32.3
+flask
+requests
+supabase
+gunicorn
