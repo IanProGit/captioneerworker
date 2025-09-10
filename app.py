@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 app.py
@@ -19,9 +20,9 @@ Optional env:
   AUDIO_ONLY=true            # If "true", extract audio for Whisper (recommended)
   AUDIO_BITRATE_KBPS=64      # 64 → ~0.5 MB/min at 16 kHz mono (ignored for WAV)
   PORT=10000
-  MAX_CONCURRENT_JOBS=5      # Maximum concurrent processing jobs (set to 1 initially)
+  MAX_CONCURRENT_JOBS=5      # Maximum concurrent processing jobs (set to 1 in Render env)
 
-Dependencies: pip install flask supabase requests gunicorn tenacity
+Dependencies: pip install flask supabase requests gunicorn
 Runtime: Requires ffmpeg (installed via Dockerfile)
 """
 
@@ -51,9 +52,9 @@ CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT_MS", "30000")) / 1000.0
 TOTAL_TIMEOUT = int(os.environ.get("TOTAL_TIMEOUT_MS", "900000")) / 1000.0
 RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
 RETRY_BASE_MS = int(os.environ.get("RETRY_BASE_MS", "500"))
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))  # Set to 1 for stability
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))  # Overridden by Render env to 1
 
-AUDIO_ONLY = os.environ.get("AUDIO_ONLY", "true").lower() == "true"
+AUDIO_ONLY = os.environ.get("AUDIO_ONLY", "true").lower() == "true"  # Overridden by Render env to true
 AUDIO_BITRATE_KBPS = int(os.environ.get("AUDIO_BITRATE_KBPS", "64"))
 
 # Hard fail if critical envs missing
@@ -356,5 +357,5 @@ def enqueue():
 
 # ---------- Entry ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, workers=1)  # Single worker for stability
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
