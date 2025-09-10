@@ -17,18 +17,17 @@ Optional env:
   RETRY_COUNT=3
   RETRY_BASE_MS=500
   AUDIO_ONLY=true            # If "true", extract audio for Whisper (recommended)
-  AUDIO_BITRATE_KBPS=64      # 64 → ~0.5 MB/min at 16 kHz mono
+  AUDIO_BITRATE_KBPS=64      # 64 → ~0.5 MB/min at 16 kHz mono (ignored for WAV)
   PORT=10000
-  MAX_CONCURRENT_JOBS=5      # Maximum concurrent processing jobs
+  MAX_CONCURRENT_JOBS=5      # Maximum concurrent processing jobs (set to 1 initially)
 
-Dependencies: pip install flask supabase requests
-Runtime: Ensure ffmpeg is installed on Render (e.g., via build.sh or Dockerfile)
+Dependencies: pip install flask supabase requests gunicorn tenacity
+Runtime: Requires ffmpeg (installed via Dockerfile)
 """
 
 import os
 import re
 import sys
-import uuid
 import time
 import tempfile
 import threading
@@ -39,7 +38,6 @@ import atexit
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ---------- Env + Constants ----------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -53,7 +51,7 @@ CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT_MS", "30000")) / 1000.0
 TOTAL_TIMEOUT = int(os.environ.get("TOTAL_TIMEOUT_MS", "900000")) / 1000.0
 RETRY_COUNT = int(os.environ.get("RETRY_COUNT", "3"))
 RETRY_BASE_MS = int(os.environ.get("RETRY_BASE_MS", "500"))
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))  # Set to 1 for stability
 
 AUDIO_ONLY = os.environ.get("AUDIO_ONLY", "true").lower() == "true"
 AUDIO_BITRATE_KBPS = int(os.environ.get("AUDIO_BITRATE_KBPS", "64"))
@@ -78,7 +76,7 @@ supa: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Concurrency control with thread pool
 _CONCURRENCY = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
-temp_files = []  # Track temp files for cleanup
+temp_files = []
 
 # UUID validation regex
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', re.I)
@@ -89,15 +87,17 @@ def _ffmpeg_available() -> bool:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         return True
     except Exception:
+        logger.warning("ffmpeg not found; audio extraction disabled")
         return False
 FFMPEG_OK = _ffmpeg_available()
 
 # Cleanup temp files on shutdown
 def cleanup_temp_files():
-    for path in temp_files:
+    for path in temp_files[:]:  # Copy to avoid modification during iteration
         try:
             if os.path.exists(path):
                 os.remove(path)
+                temp_files.remove(path)
         except Exception as e:
             logger.warning(f"Failed to clean up temp file {path}: {e}")
 atexit.register(cleanup_temp_files)
@@ -159,7 +159,6 @@ def claim_job(job_id: str) -> dict | None:
         logger.exception(f"claim_job failed for {job_id}")
         return None
 
-@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
 def download_signed_url(signed_url: str, expected_bytes: int | None) -> tuple[str, int, int]:
     start = time.time()
     attempt = 0
@@ -196,7 +195,6 @@ def download_signed_url(signed_url: str, expected_bytes: int | None) -> tuple[st
                 tmp_path = None
     raise RuntimeError(f"Download failed after {RETRY_COUNT} retries: {last_err}")
 
-@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
 def extract_audio(input_path: str, target_bitrate_kbps: int = AUDIO_BITRATE_KBPS) -> tuple[str, int, int]:
     if not FFMPEG_OK:
         raise RuntimeError("ffmpeg not available on worker; set AUDIO_ONLY=false")
@@ -205,8 +203,9 @@ def extract_audio(input_path: str, target_bitrate_kbps: int = AUDIO_BITRATE_KBPS
     os.close(fd)
     temp_files.append(out_path)
     cmd = [
-        "ffmpeg", "-y", "-i", input_path, "-vn", "-ac", "1", "-ar", "16000",
-        "-b:a", f"{target_bitrate_kbps}k", out_path
+        "ffmpeg", "-y", "-i", input_path, "-vn",
+        "-c:a", "pcm_s16le", "-ac", "1", "-ar", "16000",
+        out_path
     ]
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     size = os.path.getsize(out_path)
@@ -215,10 +214,9 @@ def extract_audio(input_path: str, target_bitrate_kbps: int = AUDIO_BITRATE_KBPS
         raise RuntimeError("Audio extraction failed or produced empty file")
     return out_path, size, ms
 
-@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
 def whisper_to_vtt(file_path: str, mime: str, force_audio: bool) -> tuple[bytes, int]:
     start = time.time()
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "verify": True}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     if force_audio:
         filename = "audio.wav"
         content_type = "audio/wav"
@@ -238,7 +236,6 @@ def whisper_to_vtt(file_path: str, mime: str, force_audio: bool) -> tuple[bytes,
     ms = int((time.time() - start) * 1000)
     return r.text.encode("utf-8"), ms
 
-@retry(stop=stop_after_attempt(RETRY_COUNT), wait=wait_exponential(multiplier=1, min=1, max=10))
 def upload_vtt(job_id: str, vtt_bytes: bytes) -> str:
     key = f"{job_id}.vtt"
     up = supa.storage.from_(OUTPUTS_BUCKET).upload(key, vtt_bytes)
@@ -360,4 +357,4 @@ def enqueue():
 # ---------- Entry ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, workers=1)  # Single worker for stability
